@@ -22,7 +22,7 @@ After that, create an isolated Anaconda environment and load CUDA drivers, an MP
 ```
 #cd plasma-python
 module load anaconda3
-conda create --name my_env --file requirements-travis.txt
+conda create --name my_env --file envs/pip-requirements-travis.txt
 conda activate my_env
 
 export OMPI_MCA_btl="tcp,self,vader"
@@ -47,7 +47,7 @@ Next, install the `plasma-python` package:
 python setup.py install
 ```
 
-Where `my_env` should contain the Python packages as per `requirements-travis.txt` file.
+Where `my_env` should contain the Python packages as per `envs/pip-requirements-travis.txt` file.
 
 ### Common build issue: cluster's MPI library and `mpi4py`
 
