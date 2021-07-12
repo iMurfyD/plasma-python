@@ -473,14 +473,29 @@ class Loader(object):
                 print(shot)
                 print(shot.number)
 
+            if self.conf['model']['flow']:
+                signaloffsetby1 = np.zeros(signal.shape)
+                signaloffsetby1[0:-1,:] = signal[1:,:]
+                assert max(signaloffsetby1.shape) == max(signal.shape)
+                assert np.count_nonzero(signaloffsetby1[-1,:]) == 0
+
             total_length += len(ttd)
             signals.append(signal)
             shot_lengths.append(len(ttd))
             disruptive.append(shot.is_disruptive)
+
             if len(ttd.shape) == 1:
-                results.append(np.expand_dims(ttd, axis=1))
+                if self.conf['model']['flow']:
+                    fulloutput = np.block([np.expand_dims(ttd, axis=1), signaloffsetby1])
+                    results.append(fulloutput)
+                else:
+                    results.append(np.expand_dims(ttd, axis=1))
             else:
-                results.append(ttd)
+                if self.conf['model']['flow']:
+                    fulloutput = np.block([ttd, signaloffsetby1])
+                    results.append(fulloutput)
+                else:
+                    results.append(ttd)
             shot.make_light()
         if not prediction_mode:
             return signals, results, total_length
@@ -510,13 +525,25 @@ class Loader(object):
             print("Shot must be at least as long as the RNN length.")
             exit(1)
 
+        if self.conf['model']['flow']:
+            signaloffsetby1 = np.zeros(signal.shape)
+            signaloffsetby1[0:-1,:] = signal[1:,:]
+            assert max(signaloffsetby1.shape) == max(signal.shape)
+            assert np.count_nonzero(signaloffsetby1[-1,:]) == 0
+
         if len(ttd.shape) == 1:
             ttd = np.expand_dims(ttd, axis=1)
         shot.make_light()
-        if not prediction_mode:
-            return signal, ttd
+
+        if self.conf['model']['flow']:
+            result = np.block([ttd, signaloffsetby1])
         else:
-            return signal, ttd, shot.is_disruptive
+            result = ttd
+
+        if not prediction_mode:
+            return signal, result
+        else:
+            return signal, result, shot.is_disruptive
 
     def batch_output_to_array(self, output, batch_size=None):
         if batch_size is None:

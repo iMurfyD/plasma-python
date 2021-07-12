@@ -357,8 +357,14 @@ class ModelBuilder(object):
                 x_in = Dropout(dropout_prob)(x_in)
             if return_sequences:
                 # x_out = TimeDistributed(Dense(100,activation='tanh')) (x_in)
-                x_out = TimeDistributed(
-                    Dense(1, activation=output_activation))(x_in)
+
+                # Flowmap (IMD, idesjard@umd.edu)
+                # If predicting outputs, make model output size distrupt score+num_signals
+                if self.conf['model']['flow']:
+                    x_out = TimeDistributed(Dense(1+num_signals, activation=output_activation))(x_in)
+                # Otherwise just predict distruption score
+                else:
+                    x_out = TimeDistributed(Dense(1, activation=output_activation))(x_in)
         model = tf.keras.Model(inputs=x_input, outputs=x_out)
         # bug with tensorflow/Keras
         # TODO(KGF): what is this bug? this is the only direct "tensorflow"
