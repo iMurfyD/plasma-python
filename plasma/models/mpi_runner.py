@@ -813,6 +813,8 @@ def mpi_make_predictions_and_evaluate(conf, shot_list, loader,
                                       custom_path=None):
     y_prime, y_gold, disruptive = mpi_make_predictions(
         conf, shot_list, loader, custom_path)
+    y_prime = [yp[:,0] for yp in y_prime]
+    y_gold = [yg[:,0] for yg in y_gold]
     analyzer = PerformanceAnalyzer(conf=conf)
     roc_area = analyzer.get_roc_area(y_prime, y_gold, disruptive)
     shot_list.set_weights(
