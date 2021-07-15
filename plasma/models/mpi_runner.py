@@ -829,6 +829,8 @@ def mpi_make_predictions_and_evaluate_multiple_times(conf, shot_list, loader,
                                                        custom_path)
     areas = []
     losses = []
+    y_prime_disr = [yp[:,0] for yp in y_prime]
+    y_gold_disr  = [yg[:,0] for yg in y_gold]
     for T_min_curr in times:
         # if 'monitor_test' in conf['callbacks'].keys() and
         # conf['callbacks']['monitor_test']:
@@ -837,7 +839,7 @@ def mpi_make_predictions_and_evaluate_multiple_times(conf, shot_list, loader,
         conf_curr['data']['T_min_warn'] = T_min_curr
         assert conf['data']['T_min_warn'] == T_min_warn_orig
         analyzer = PerformanceAnalyzer(conf=conf_curr)
-        roc_area = analyzer.get_roc_area(y_prime, y_gold, disruptive)
+        roc_area = analyzer.get_roc_area(y_prime_disr, y_gold_disr, disruptive)
         # shot_list.set_weights(analyzer.get_shot_difficulty(y_prime, y_gold,
         # disruptive))
         loss = get_loss_from_list(y_prime, y_gold, conf['data']['target'])
