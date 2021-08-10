@@ -478,6 +478,8 @@ class Loader(object):
                 signaloffsetby1[0:-1,:] = signal[1:,:]
                 assert max(signaloffsetby1.shape) == max(signal.shape)
                 assert np.count_nonzero(signaloffsetby1[-1,:]) == 0
+                signal_increment = signaloffsetby1 - signal
+                assert max(signal_increment.shape) == max(signal.shape)
 
             total_length += len(ttd)
             signals.append(signal)
@@ -486,13 +488,13 @@ class Loader(object):
 
             if len(ttd.shape) == 1:
                 if self.conf['model']['flow']:
-                    fulloutput = np.block([np.expand_dims(ttd, axis=1), signaloffsetby1])
+                    fulloutput = np.block([np.expand_dims(ttd, axis=1), signal_increment])
                     results.append(fulloutput)
                 else:
                     results.append(np.expand_dims(ttd, axis=1))
             else:
                 if self.conf['model']['flow']:
-                    fulloutput = np.block([ttd, signaloffsetby1])
+                    fulloutput = np.block([ttd, signal_increment])
                     results.append(fulloutput)
                 else:
                     results.append(ttd)
@@ -530,13 +532,15 @@ class Loader(object):
             signaloffsetby1[0:-1,:] = signal[1:,:]
             assert max(signaloffsetby1.shape) == max(signal.shape)
             assert np.count_nonzero(signaloffsetby1[-1,:]) == 0
+            signal_increment = signaloffsetby1 - signal
+            assert max(signal_increment.shape) == max(signal.shape)
 
         if len(ttd.shape) == 1:
             ttd = np.expand_dims(ttd, axis=1)
         shot.make_light()
 
         if self.conf['model']['flow']:
-            result = np.block([ttd, signaloffsetby1])
+            result = np.block([ttd, signal_increment])
         else:
             result = ttd
 
