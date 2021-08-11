@@ -12,8 +12,10 @@ from plasma.utils.state_reset import reset_states
 # Keras "Using TensorFlow backend" stderr messages do not interfere in stdout
 from plasma.conf import conf
 from mpi4py import MPI
-from pkg_resources import parse_version, get_distribution, DistributionNotFound
 import random
+import itertools
+from packaging import version
+import contextlib
 '''
 #########################################################
 This file trains a deep learning model to predict
@@ -56,10 +58,6 @@ if g.backend == 'tf' or g.backend == 'tensorflow':
         os.environ['CUDA_VISIBLE_DEVICES'] = '{}'.format(g.MY_GPU)
         # ,mode=NanGuardMode'
     os.environ['KERAS_BACKEND'] = 'tensorflow'  # default setting
-    try:
-        g.tf_ver = parse_version(get_distribution(g.backendpackage).version)
-    except DistributionNotFound:
-        g.tf_ver = parse_version(get_distribution('tensorflow').version)
     # compat/compat.py first committed on 2018-06-29 for Py 2 vs 3
     # (around, but not present in, the release of v1.9.0)
     # v2 compatiblity code added, then moved from compat.py in Nov and Dec 2018
@@ -71,6 +69,7 @@ if g.backend == 'tf' or g.backend == 'tensorflow':
     #     import tensorflow.compat.v1 as tf
     # else:
     import tensorflow as tf
+    g.tf_ver = tf.__version__ # setting g.tf_ver moved after the import Summer 2021
     # TODO(KGF): above, builder.py (bug workaround), mpi_launch_tensorflow.py,
     # and runner.py are the only files that import tensorflow directly
 
@@ -564,7 +563,12 @@ class MPIModel():
         while ((self.num_so_far - self.epoch * num_total) < num_total
                or step < self.num_batches_minimum):
             # TODO(KGF): this is still not correctly tracing the steps on CPU
-            with tf.profiler.experimental.Trace('train', step_num=step, _r=1):
+            if version.parse(g.tf_ver) >= version.parse('2.2.0'):
+                # TensorFlow profiler added in April 2020, TF 2.2.0
+                cm = tf.profiler.experimental.Trace('train', step_num=step, _r=1)
+            else:
+                cm = contextlib.nullcontext()
+            with cm:
                 if step_limit > 0 and step > step_limit:
                     print('reached step limit')
                     break
@@ -614,30 +618,46 @@ class MPIModel():
                 t0 = time.time()
                 deltas, loss = self.train_on_batch_and_get_deltas(
                     batch_xs, batch_ys, verbose)
-                t1 = time.time()
-                if not is_warmup_period:
-                    self.set_new_weights(deltas, num_replicas)
-                    t2 = time.time()
-                    write_str_0 = self.calculate_speed(t0, t1, t2, num_replicas)
-                    curr_loss = self.mpi_average_scalars(1.0*loss, num_replicas)
-                    # g.print_unique(self.model.get_weights()[0][0][:4])
-                    loss_averager.add_val(curr_loss)
-                    ave_loss = loss_averager.get_ave()
-                    eta = self.estimate_remaining_time(
-                        t0 - t_start, self.num_so_far - self.epoch*num_total,
+                self.comm.Barrier()
+                sys.stdout.flush()
+                # TODO(KGF): check line feed/carriage returns around this
+                g.print_unique('\nCompilation finished in {:.2f}s'.format(
+                    time.time() - t0_comp))
+                t_start = time.time()
+                sys.stdout.flush()
+
+            if np.any(batches_to_reset):
+                reset_states(self.model, batches_to_reset)
+            if ('noise' in self.conf['training'].keys()
+                    and self.conf['training']['noise'] is not False):
+                batch_xs = self.add_noise(batch_xs)
+            t0 = time.time()
+            deltas, loss = self.train_on_batch_and_get_deltas(
+                batch_xs, batch_ys, verbose)
+            t1 = time.time()
+            if not is_warmup_period:
+                self.set_new_weights(deltas, num_replicas)
+                t2 = time.time()
+                write_str_0 = self.calculate_speed(t0, t1, t2, num_replicas)
+                curr_loss = self.mpi_average_scalars(1.0*loss, num_replicas)
+                # g.print_unique(self.model.get_weights()[0][0][:4])
+                loss_averager.add_val(curr_loss)
+                ave_loss = loss_averager.get_ave()
+                eta = self.estimate_remaining_time(
+                    t0 - t_start, self.num_so_far - self.epoch*num_total,
+                    num_total)
+                write_str = (
+                    '\r[{}] step: {} [ETA: {:.2f}s] [{:.2f}/{}], '.format(
+                        self.task_index, step, eta, 1.0*self.num_so_far,
                         num_total)
-                    write_str = (
-                        '\r[{}] step: {} [ETA: {:.2f}s] [{:.2f}/{}], '.format(
-                            self.task_index, step, eta, 1.0*self.num_so_far,
-                            num_total)
-                        + 'loss: {:.5f} [{:.5f}] | '.format(ave_loss, curr_loss)
-                        + 'walltime: {:.4f} | '.format(
-                            time.time() - self.start_time))
-                    g.write_unique(write_str + write_str_0)
-                    step += 1
-                else:
-                    g.write_unique('\r[{}] warmup phase, num so far: {}'.format(
-                        self.task_index, self.num_so_far))
+                    + 'loss: {:.5f} [{:.5f}] | '.format(ave_loss, curr_loss)
+                    + 'walltime: {:.4f} | '.format(
+                        time.time() - self.start_time))
+                g.write_unique(write_str + write_str_0)
+                step += 1
+            else:
+                g.write_unique('\r[{}] warmup phase, num so far: {}'.format(
+                    self.task_index, self.num_so_far))
 
         effective_epochs = 1.0*self.num_so_far/num_total
         epoch_previous = self.epoch
@@ -767,29 +787,34 @@ def mpi_make_predictions(conf, shot_list, loader, custom_path=None):
     if g.task_index != 0:
         loader.verbose = False
 
-    g.write_unique('num workers= {}\nlen(shot_sublists)={}, num_shots = {}\n'.format(g.num_workers, len(shot_sublists), len(shot_list)))
-    freeme = False
+    # MPI loop works by predicting in batches of the 
+    # largest possible multiple of len(shot_sublists) < num_workers
+    # i.e. if there are 9 shot_sublists and 4 workers,
+    #      worker 0 will predict shot_sublist 0, 4, and 8
+    #      workers 1-3 will predict shot_sublist 1-3 and 5-7 respectively
+    # each makes their prediction on the ith iteration of the loop
+    #      (i.e. worker 0 predicts shot_sublist 0 on loop iteration i=0)
+    #      and then skips through loop iterations unless it has to predict again (i=4)
+    #      or aggregate predictions with other workers, after each worker has made a prediction
+    #      which happens every num_workers iterations in the for loop
+    #      (i.e. worker 0 will aggregate predictions with workers 1-3 at the end of i=3)
+    # During the aggregation step, each worker is uses its color (which denotes whether it was
+    # predicting or not predicting during the last few runs of the for loop) to split the main comm
+    # The predictors (color = 1) share their predictions with first each other, and then to everyone
+    # the nonpredictors (color = 2) only recieve the global predictions from the predictors
+    color = 2
     for (i, shot_sublist) in enumerate(shot_sublists):
         shpz = []
         max_length = -1 # So non shot predictive workers don't have a real length
-        g.write_all('My task index = {}, i mod num_workers = {}\n'.format(g.task_index, i%g.num_workers))
         if i % g.num_workers == g.task_index:
-            g.write_all('Creating new comm\n')
             color = 1
-            temp_predictor_only_comm = MPI.Comm.Split(g.comm, color, i)
-            freeme = True
-            # Create new MPI comm to pass around rank
-            g.write_all('Starting to load and predict subroutine\n')
             X, y, shot_lengths, disr = loader.load_as_X_y_pred(shot_sublist)
-            g.write_all('X, y, lengths, disr loaded, shot_lengths shape: {} \n'.format(len(shot_lengths)))
 
             # load data and fit on data
             y_p = model.predict(X, batch_size=conf['model']['pred_batch_size'])
             model.reset_states()
             y_p = loader.batch_output_to_array(y_p)
             y = loader.batch_output_to_array(y)
-
-            g.write_all('Finished le prediction\n')
 
             # cut arrays back
             y_p = [arr[:shot_lengths[j]] for (j, arr) in enumerate(y_p)]
@@ -799,113 +824,73 @@ def mpi_make_predictions(conf, shot_list, loader, custom_path=None):
             y_gold += y
             disruptive += disr
 
-            # Create numpy block from y list which is used in MPI
-            # Pads y_prime and y_gold with zeros to make it all fit
-            shpz = [y.shape for y in y_prime]
-            max_length = max([max(y.shape) for y in y_p])
-            g.write_all(' max length = {}\n'.format(max_length))
-            max_length = temp_predictor_only_comm.allreduce(max_length, MPI.MAX) 
-            g.write_all('Calculated shpz\n')
-            y_prime_numpy = np.stack([np.pad(sublist, pad_width=((0,max_length-max(sublist.shape)),(0,0))) for sublist in y_prime])
-            y_gold_numpy = np.stack([np.pad(sublist, pad_width=((0,max_length-max(sublist.shape)),(0,0))) for sublist in y_gold])
-            g.write_all('First Barrier\n')
-            g.comm.Barrier()
-        elif g.task_index < len(shot_sublists):
-            pass
-        else:
-            if i == 0:
-                color = 2
-                temp_predictor_only_comm = MPI.Comm.Split(g.comm, color, i)
-                freeme = True
-                g.write_all('First Barrier (other threads)\n')
-                g.comm.Barrier()
-                g.write_all('Past First Barrier (other threads)\n')
-            
-
         if (i % g.num_workers == g.num_workers - 1
                 or i == len(shot_sublists) - 1):
-
-            g.write_all('Entered second area\n')
-            g.comm.Barrier()
-            # Create numpy array to store all processors output, then aggregate and unpad using MPI gathered shape list
-            g.write_all('getting shapez\n')
-            shpzg = g.comm.allgather(shpz)
-            shpzg = [s for s in shpzg if s != [] and s != [0]]
-            shpzg = shpzg[0]
-            shpzg = [s[0] for s in shpzg]
+            # Create numpy block from y list which is used in MPI
+            # Pads y_prime and y_gold with zeros to maximum shot length within block being transferred
+            if color ==1:
+                shpz = [max(y.shape) for y in y_prime]
+                max_length = max([max(y.shape) for y in y_p])
             max_length = g.comm.allreduce(max_length, MPI.MAX) 
-            g.write_unique(str(shpzg)+'\n')
-            g.write_all('gotting shapez\n')
-            # Todo: Figure out if empty shots are added to fit batch length
-            y_primeg = np.zeros((len(shot_sublists)*conf['model']['pred_batch_size'],max_length,1), dtype=conf['data']['floatx'])
-            y_goldg  = np.zeros((len(shot_sublists)*conf['model']['pred_batch_size'],max_length,1), dtype=conf['data']['floatx'])
+            if color == 1:
+                y_prime_numpy = np.stack([np.pad(sublist, pad_width=((0,max_length-max(sublist.shape)),(0,0))) for sublist in y_prime])
+                y_gold_numpy = np.stack([np.pad(sublist, pad_width=((0,max_length-max(sublist.shape)),(0,0))) for sublist in y_gold])
+            
+            temp_predictor_only_comm = MPI.Comm.Split(g.comm, color, i)
+            # Create numpy array to store all processors output, then aggregate and unpad using MPI gathered shape list
+            shpzg = g.comm.allgather(shpz)
+            shpzg = list(itertools.chain(*shpzg))
+            shpzg = [s for s in shpzg if s != []]
+            max_length = g.comm.allreduce(max_length, MPI.MAX) 
+            if color == 1:
+                num_pred = temp_predictor_only_comm.size
+            else:
+                num_pred = g.comm.size - temp_predictor_only_comm.size
+            y_primeg = np.zeros((num_pred*conf['model']['pred_batch_size'],max_length,1), dtype=conf['data']['floatx'])
+            y_goldg  = np.zeros((num_pred*conf['model']['pred_batch_size'],max_length,1), dtype=conf['data']['floatx'])
             y_primeg_flattend = np.zeros(y_primeg.flatten().shape)
             y_goldg_flattend  = np.zeros(y_goldg.flatten().shape)
-            g.write_all('initialized golbals\n')
-            # TODO (IMD) Support more floating point types
-            # ValueError: message: cannot infer count, number of entries 10652818 is not a multiple of required number of blocks 9
-            # Need to send an unequal sized array I think
             if color == 1:
-                g.write_all('y_prime_numpy.shape = {}\n'.format(y_prime_numpy.shape))
-                g.write_all('y_prime_numpy_flattend.shape = {}\n'.format(y_prime_numpy.flatten().shape))
-                g.write_all('y_gold_numpy.shape = {}\n'.format(y_gold_numpy.shape))
-                g.write_all('y_gold_numpy_flattend.shape = {}\n'.format(y_gold_numpy.flatten().shape))
-                g.write_all('y_prime_g.shape = {}\n'.format(y_primeg.shape))
-                g.write_all('y_primeg_flattend.shape = {}\n'.format(y_primeg_flattend.shape))
-                g.write_all('y_goldg_flattend.shape = {}\n'.format(y_goldg_flattend.shape))
                 # Ensure that numpy arrays have correct dimensions before gathering them
-                assert len(shot_sublists)*max(y_prime_numpy.flatten().shape) == max(y_primeg_flattend.shape)
-                assert len(shot_sublists)*max(y_gold_numpy.flatten().shape) == max(y_goldg_flattend.shape)
+                assert num_pred*max(y_prime_numpy.flatten().shape) == max(y_primeg_flattend.shape)
+                assert num_pred*max(y_gold_numpy.flatten().shape) == max(y_goldg_flattend.shape)
                 temp_predictor_only_comm.Allgather(y_prime_numpy.flatten(), y_primeg_flattend)
                 temp_predictor_only_comm.Allgather(y_gold_numpy.flatten(), y_goldg_flattend)
-            # Process 0 broadcast y_primeg adn y_goldg to all processors, including ones
+            # Process 0 broadcast y_primeg and y_goldg to all processors, including ones
             # not involved in calculating predictions so they can each create their own 
             # y_prime_global and y_gold_global
             g.comm.Barrier()
-            g.write_all('Broadcasting y_primeg and y_goldg to every\n')
             g.comm.Bcast(y_primeg_flattend, root=0)
             g.comm.Bcast(y_goldg_flattend, root=0) 
-            g.write_all('All gathered initialized golbals len1={}, len2={}\n'.format(len(y_primeg_flattend), len(y_goldg_flattend)))
-            y_primeg_flattend = np.split(y_primeg_flattend, len(shot_sublists))
-            y_goldg_flattend = np.split(y_goldg_flattend, len(shot_sublists))
-            y_primeg = [y.reshape((128, max_length, 1)) for y in y_primeg_flattend]
-            y_goldg = [y.reshape((128, max_length, 1)) for y in y_goldg_flattend]
-            g.write_all('primeg length: {}\n'.format(len(y_primeg)))
+            y_primeg_flattend = np.split(y_primeg_flattend, num_pred)
+            y_goldg_flattend = np.split(y_goldg_flattend, num_pred)
+            y_primeg = [y.reshape((conf['model']['pred_batch_size'], max_length, 1)) for y in y_primeg_flattend]
+            y_goldg = [y.reshape((conf['model']['pred_batch_size'], max_length, 1)) for y in y_goldg_flattend]
             y_primeg = np.concatenate(y_primeg, axis=0)
-            g.write_all('primeg shape after stack: {}\n'.format(y_primeg.shape))
             y_goldg  = np.concatenate(y_goldg, axis=0)
-            y_primeg_list = []
-            y_goldg_list = []
-            # Unpad
-            g.write_all('unpadding len(shpzg)={}, shpzg[0]={}\n'.format(len(shpzg),shpzg[0]))
-            # need to have subgroups gather a broadcast y_prmeg (maybe do above)
+            # Unpad each shot to its true length
             for idx, s in enumerate(shpzg):
-                trim = lambda nparry, s: nparry#(0:int(s),:)
-                y_primeg[idx] = trim(y_primeg[idx],s)
-                y_goldg[idx] = trim(y_goldg[idx], s)
+                trim = lambda nparry, s: nparry[0:int(s),:]
+                y_prime_global.append(trim(y_primeg[idx],s))
+                y_gold_global.append(trim(y_goldg[idx], s))
 
             disruptive_global += concatenate_sublists(
                 g.comm.allgather(disruptive))
-            g.comm.Barrier()
             y_prime = []
             y_gold = []
-            disruptive = []
+            disruptive = [] 
+            color = 2
+            temp_predictor_only_comm.Free()
 
         if g.task_index == 0:
             pbar.add(1.0*len(shot_sublist))
 
-        if freeme and (g.task_index > len(shot_sublists) and i == 0):
-            temp_predictor_only_comm.Free()
-            freeme = False
-
-    #y_prime_global = y_prime_global[:len(shot_list)]
-    y_primeg = y_primeg[:len(shot_list)]
-    #y_gold_global = y_gold_global[:len(shot_list)]
-    y_goldg = y_goldg[:len(shot_list)]
+    y_prime_global = y_prime_global[:len(shot_list)]
+    y_gold_global = y_gold_global[:len(shot_list)]
     disruptive_global = disruptive_global[:len(shot_list)]
     loader.set_inference_mode(False)
 
-    return y_primeg, y_goldg, disruptive_global
+    return y_prime_global, y_gold_global, disruptive_global
 
 
 def mpi_make_predictions_and_evaluate(conf, shot_list, loader,
@@ -915,11 +900,6 @@ def mpi_make_predictions_and_evaluate(conf, shot_list, loader,
     y_prime = [yp[:,0] for yp in y_prime]
     y_gold = [yg[:,0] for yg in y_gold]
     analyzer = PerformanceAnalyzer(conf=conf)
-    g.write_all('Afterwards y_prime length = {}\n'.format(len(y_prime)))
-    g.write_all('Afterwards y_prime[0] shape = {}\n'.format(y_prime[0].shape))
-    g.write_all('Afterwards y_gold length = {}\n'.format(len(y_gold)))
-    g.write_all('Afterwards y_gold[0] shape = {}\n'.format(y_gold[0].shape))
-    g.write_all('Afterwards distruptive length = {}\n'.format(len(disruptive)))
     roc_area = analyzer.get_roc_area(y_prime, y_gold, disruptive)
     shot_list.set_weights(
         analyzer.get_shot_difficulty(y_prime, y_gold, disruptive))
@@ -961,7 +941,7 @@ def mpi_train(conf, shot_list_train, shot_list_validate, loader,
     conf['num_workers'] = g.comm.Get_size()
 
     specific_builder = builder.ModelBuilder(conf)
-    if g.tf_ver >= parse_version('1.14.0'):
+    if version.parse(g.tf_ver) >= version.parse('1.14.0'):
         # Internal TensorFlow flags, subject to change (v1.14.0+ only?)
         try:
             from tensorflow.python.util import module_wrapper as depr
@@ -1056,8 +1036,8 @@ def mpi_train(conf, shot_list_train, shot_list_validate, loader,
         best_so_far = np.inf
         cmp_fn = min
 
-    if conf['training']['timeline_prof']:
-        tf.profiler.experimental.start('./logs')
+    # if conf['training']['timeline_prof']:
+    #     tf.profiler.experimental.start('./logs')
 
     while e < num_epochs:
         g.write_unique('\nBegin training from epoch {:.2f}/{}'.format(
@@ -1165,8 +1145,8 @@ def mpi_train(conf, shot_list_train, shot_list_validate, loader,
         if stop_training:
             g.write_unique("Stopping training due to early stopping")
             break
-    if conf['training']['timeline_prof']:
-        tf.profiler.experimental.stop()
+    # if conf['training']['timeline_prof']:
+    #     tf.profiler.experimental.stop()
 
     if g.task_index == 0:
         callbacks.on_train_end()
