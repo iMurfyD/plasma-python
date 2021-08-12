@@ -474,7 +474,7 @@ class Loader(object):
                 print(shot.number)
 
             if self.conf['model']['flow']:
-                signaloffsetby1 = np.zeros(signal.shape)
+                signaloffsetby1 = np.zeros(signal.shape,dtype=self.conf['data']['floatx'])
                 signaloffsetby1[0:-1,:] = signal[1:,:]
                 assert max(signaloffsetby1.shape) == max(signal.shape)
                 assert np.count_nonzero(signaloffsetby1[-1,:]) == 0
@@ -526,7 +526,7 @@ class Loader(object):
             exit(1)
 
         if self.conf['model']['flow']:
-            signaloffsetby1 = np.zeros(signal.shape)
+            signaloffsetby1 = np.zeros(signal.shape,dtype=self.conf['data']['floatx'])
             signaloffsetby1[0:-1,:] = signal[1:,:]
             assert max(signaloffsetby1.shape) == max(signal.shape)
             assert np.count_nonzero(signaloffsetby1[-1,:]) == 0
