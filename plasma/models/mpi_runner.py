@@ -846,8 +846,8 @@ def mpi_make_predictions(conf, shot_list, loader, custom_path=None):
                 num_pred = temp_predictor_only_comm.size
             else:
                 num_pred = g.comm.size - temp_predictor_only_comm.size
-            y_primeg = np.zeros((num_pred*conf['model']['pred_batch_size'],max_length,1), dtype=conf['data']['floatx'])
-            y_goldg  = np.zeros((num_pred*conf['model']['pred_batch_size'],max_length,1), dtype=conf['data']['floatx'])
+            y_primeg = np.zeros((num_pred*conf['model']['pred_batch_size'],max_length,10), dtype=conf['data']['floatx'])
+            y_goldg  = np.zeros((num_pred*conf['model']['pred_batch_size'],max_length,10), dtype=conf['data']['floatx'])
             y_primeg_flattend = np.zeros(y_primeg.flatten().shape)
             y_goldg_flattend  = np.zeros(y_goldg.flatten().shape)
             if color == 1:
@@ -864,8 +864,8 @@ def mpi_make_predictions(conf, shot_list, loader, custom_path=None):
             g.comm.Bcast(y_goldg_flattend, root=0) 
             y_primeg_flattend = np.split(y_primeg_flattend, num_pred)
             y_goldg_flattend = np.split(y_goldg_flattend, num_pred)
-            y_primeg = [y.reshape((conf['model']['pred_batch_size'], max_length, 1)) for y in y_primeg_flattend]
-            y_goldg = [y.reshape((conf['model']['pred_batch_size'], max_length, 1)) for y in y_goldg_flattend]
+            y_primeg = [y.reshape((conf['model']['pred_batch_size'], max_length, 10)) for y in y_primeg_flattend]
+            y_goldg = [y.reshape((conf['model']['pred_batch_size'], max_length, 10)) for y in y_goldg_flattend]
             y_primeg = np.concatenate(y_primeg, axis=0)
             y_goldg  = np.concatenate(y_goldg, axis=0)
             # Unpad each shot to its true length
